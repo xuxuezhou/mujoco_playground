@@ -105,9 +105,20 @@ class CubeReorient(leap_hand_base.LeapHandEnv):
     self._default_pose = self._init_q[self._hand_qids]
 
   def reset(self, rng: jax.Array) -> mjx_env.State:
-    # Randomize the goal orientation.
+    # Randomize the goal orientation within xyz Euler ranges [0, pi/2].
     rng, goal_rng = jax.random.split(rng)
-    goal_quat = leap_hand_base.uniform_quat(goal_rng)
+    def _euler_xyz_to_quat(rx, ry, rz):
+      # Convert intrinsic XYZ Euler angles to quaternion (w, x, y, z).
+      hx, hy, hz = rx * 0.5, ry * 0.5, rz * 0.5
+      cx, cy, cz = jp.cos(hx), jp.cos(hy), jp.cos(hz)
+      sx, sy, sz = jp.sin(hx), jp.sin(hy), jp.sin(hz)
+      w = cx * cy * cz - sx * sy * sz
+      x = sx * cy * cz + cx * sy * sz
+      y = cx * sy * cz - sx * cy * sz
+      z = cx * cy * sz + sx * sy * cz
+      return math.normalize(jp.array([w, x, y, z]))
+    rxryrz = jax.random.uniform(goal_rng, (3,), minval=0.0, maxval=jp.pi / 2.0)
+    goal_quat = _euler_xyz_to_quat(rxryrz[0], rxryrz[1], rxryrz[2])
 
     # Randomize the hand pose.
     rng, pos_rng, vel_rng = jax.random.split(rng, 3)
@@ -118,12 +129,9 @@ class CubeReorient(leap_hand_base.LeapHandEnv):
     )
     v_hand = 0.0 * jax.random.normal(vel_rng, (consts.NV,))
 
-    # Randomize the cube pose.
-    rng, p_rng, quat_rng = jax.random.split(rng, 3)
-    start_pos = jp.array([0.1, 0.0, 0.05]) + jax.random.uniform(
-        p_rng, (3,), minval=-0.01, maxval=0.01
-    )
-    start_quat = leap_hand_base.uniform_quat(quat_rng)
+    # Fix the cube position; fix initial cube orientation to identity.
+    start_pos = jp.array([0.1, 0.0, 0.10])
+    start_quat = jp.array([1.0, 0.0, 0.0, 0.0])
     q_cube = jp.array([*start_pos, *start_quat])
     v_cube = jp.zeros(6)
 
@@ -178,6 +186,8 @@ class CubeReorient(leap_hand_base.LeapHandEnv):
         "cube_pos_error_history": jp.zeros(self._config.history_len * 3),
         "cube_ori_error_history": jp.zeros(self._config.history_len * 6),
         "goal_quat_dquat": jp.zeros(3),
+        # For logging: the sampled goal euler angles used to construct goal_quat.
+        "goal_euler_xyz": rxryrz,
         # Perturbation.
         "pert_wait_steps": pert_wait_steps,
         "pert_duration_steps": pert_duration_steps,

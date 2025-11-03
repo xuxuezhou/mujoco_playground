@@ -94,6 +94,19 @@ _NUM_TIMESTEPS = flags.DEFINE_integer(
 _NUM_VIDEOS = flags.DEFINE_integer(
     "num_videos", 1, "Number of videos to record after training."
 )
+_RECORD_SUCCESS = flags.DEFINE_boolean(
+    "record_success",
+    False,
+    "If true, run N episodes post-training and log success rate.",
+)
+_SUCCESS_EPISODES = flags.DEFINE_integer(
+    "success_episodes", 100, "Number of episodes for success-rate evaluation"
+)
+_SAVE_SUCCESS_VIDEO = flags.DEFINE_boolean(
+    "save_success_video",
+    True,
+    "During success-rate evaluation, save a combined video of first 3 episodes.",
+)
 _NUM_EVALS = flags.DEFINE_integer("num_evals", 5, "Number of evaluations")
 _REWARD_SCALING = flags.DEFINE_float("reward_scaling", 0.1, "Reward scaling")
 _EPISODE_LENGTH = flags.DEFINE_integer("episode_length", 1000, "Episode length")
@@ -452,66 +465,111 @@ def main(argv):
   # Create inference function.
   inference_fn = make_inference_fn(params, deterministic=True)
   jit_inference_fn = jax.jit(inference_fn)
+  jit_reset = jax.jit(eval_env.reset)
+  jit_step = jax.jit(eval_env.step)
 
-  # Run evaluation rollouts.
-  def do_rollout(rng, state):
-    empty_data = state.data.__class__(
-        **{k: None for k in state.data.__annotations__}
-    )  # pytype: disable=attribute-error
-    empty_traj = state.__class__(**{k: None for k in state.__annotations__})  # pytype: disable=attribute-error
-    empty_traj = empty_traj.replace(data=empty_data)
+  if _RECORD_SUCCESS.value:
+    # Inference over N episodes, log success and completion time; optional combined video.
+    num_infer_episodes = int(_SUCCESS_EPISODES.value)
+    render_every = 2
+    fps = 1.0 / eval_env.dt / render_every
+    print(f"FPS for rendering: {fps}")
+    scene_option = mujoco.MjvOption()
+    scene_option.flags[mujoco.mjtVisFlag.mjVIS_TRANSPARENT] = False
+    scene_option.flags[mujoco.mjtVisFlag.mjVIS_PERTFORCE] = False
+    scene_option.flags[mujoco.mjtVisFlag.mjVIS_CONTACTFORCE] = False
 
-    def step(carry, _):
-      state, rng = carry
-      rng, act_key = jax.random.split(rng)
-      act = jit_inference_fn(state.obs, act_key)[0]
-      state = eval_env.step(state, act)
-      traj_data = empty_traj.tree_replace({
-          "data.qpos": state.data.qpos,
-          "data.qvel": state.data.qvel,
-          "data.time": state.data.time,
-          "data.ctrl": state.data.ctrl,
-          "data.mocap_pos": state.data.mocap_pos,
-          "data.mocap_quat": state.data.mocap_quat,
-          "data.xfrc_applied": state.data.xfrc_applied,
-      })
-      if _VISION.value:
-        traj_data = jax.tree_util.tree_map(lambda x: x[0], traj_data)
-      return (state, rng), traj_data
+    success_flags = []
+    completion_steps = []
+    videos_saved = 0
+    combined_frames = []
+    log_path = (logdir / "inference_log.txt").as_posix()
+    with open(log_path, "w", encoding="utf-8") as f:
+      rng = jax.random.PRNGKey(_SEED.value)
+      times_sec = []
+      time_limit_steps = max(1, int(15.0 / float(eval_env.dt)))
+      for ep in range(num_infer_episodes):
+        rng, reset_key = jax.random.split(rng)
+        state = jit_reset(reset_key)
+        try:
+          goal_euler = state.info.get("goal_euler_xyz", jp.zeros((3,)))
+        except Exception:  # pylint: disable=broad-except
+          goal_euler = jp.zeros((3,))
+        rollout_states = [state] if (_SAVE_SUCCESS_VIDEO.value and videos_saved < 3) else None
+        success = False
+        first_success_step = None
+        max_steps = min(_EPISODE_LENGTH.value, time_limit_steps)
+        for t in range(max_steps):
+          rng, act_key = jax.random.split(rng)
+          act = jit_inference_fn(state.obs, act_key)[0]
+          state = jit_step(state, act)
+          if rollout_states is not None:
+            rollout_states.append(state)
+          step_success = (state.metrics.get("reward/success", jp.array(0.0)) > 0.5)
+          if (not success) and bool(step_success):
+            success = True
+            first_success_step = t + 1
+            break
+          if bool(state.done):
+            break
 
-    _, traj = jax.lax.scan(
-        step, (state, rng), None, length=_EPISODE_LENGTH.value
-    )
-    return traj
+        success_flags.append(int(success))
+        steps = first_success_step if first_success_step is not None else (t + 1)
+        completion_steps.append(steps)
+        time_sec = steps * float(eval_env.dt)
+        times_sec.append(time_sec)
+        avg_time_sec = sum(times_sec) / len(times_sec)
+        rx, ry, rz = [float(x) for x in list(goal_euler)]
+        success_cnt = sum(success_flags)
+        line = (
+            f"EPISODE {ep + 1}: Random Goal Euler XYZ (rad): "
+            f"rx={rx:.4f}, ry={ry:.4f}, rz={rz:.4f} | "
+            f"TIME: {time_sec:.2f}s | AVG TIME: {avg_time_sec:.2f}s | "
+            f"CUMULATIVE SUCCESS RATE: {success_cnt}/{ep + 1} "
+            f"({(success_cnt / (ep + 1)):.2%})\n"
+        )
+        f.write(line)
+        f.flush()
+        os.fsync(f.fileno())
 
-  rng = jax.random.split(jax.random.PRNGKey(_SEED.value), _NUM_VIDEOS.value)
-  reset_states = jax.jit(jax.vmap(eval_env.reset))(rng)
-  if _VISION.value:
-    reset_states = jax.tree_util.tree_map(lambda x: x[0], reset_states)
-  traj_stacked = jax.jit(jax.vmap(do_rollout))(rng, reset_states)
-  trajectories = [None] * _NUM_VIDEOS.value
-  for i in range(_NUM_VIDEOS.value):
-    t = jax.tree.map(lambda x, i=i: x[i], traj_stacked)
-    trajectories[i] = [
-        jax.tree.map(lambda x, j=j: x[j], t)
-        for j in range(_EPISODE_LENGTH.value)
-    ]
+        if rollout_states is not None:
+          traj = rollout_states[::render_every]
+          frames = eval_env.render(traj, height=480, width=640, scene_option=scene_option)
+          for frame in frames:
+            combined_frames.append(frame)
+          videos_saved += 1
 
-  # Render and save the rollout.
-  render_every = 2
-  fps = 1.0 / eval_env.dt / render_every
-  print(f"FPS for rendering: {fps}")
-  scene_option = mujoco.MjvOption()
-  scene_option.flags[mujoco.mjtVisFlag.mjVIS_TRANSPARENT] = False
-  scene_option.flags[mujoco.mjtVisFlag.mjVIS_PERTFORCE] = False
-  scene_option.flags[mujoco.mjtVisFlag.mjVIS_CONTACTFORCE] = False
-  for i, rollout in enumerate(trajectories):
-    traj = rollout[::render_every]
-    frames = eval_env.render(
-        traj, height=480, width=640, scene_option=scene_option
-    )
-    media.write_video(f"rollout{i}.mp4", frames, fps=fps)
-    print(f"Rollout video saved as 'rollout{i}.mp4'.")
+    success_rate = sum(success_flags) / num_infer_episodes
+    print(f"Inference complete. Success rate over {num_infer_episodes} episodes: {success_rate:.3f}")
+    print(f"Per-episode completion steps (first 10): {completion_steps[:10]}")
+    print(f"Detailed log written to: {log_path}")
+
+    if _SAVE_SUCCESS_VIDEO.value and combined_frames:
+      media.write_video("inhand_reorientation_playground.mp4", combined_frames, fps=fps)
+      print("Combined rollout video saved as 'inhand_reorientation_playground.mp4'.")
+  else:
+    # Save standard rollouts per --num_videos
+    render_every = 2
+    fps = 1.0 / eval_env.dt / render_every
+    scene_option = mujoco.MjvOption()
+    scene_option.flags[mujoco.mjtVisFlag.mjVIS_TRANSPARENT] = False
+    scene_option.flags[mujoco.mjtVisFlag.mjVIS_PERTFORCE] = False
+    scene_option.flags[mujoco.mjtVisFlag.mjVIS_CONTACTFORCE] = False
+
+    for i in range(_NUM_VIDEOS.value):
+      key = jax.random.PRNGKey(_SEED.value + i)
+      state = jit_reset(key)
+      traj = [state]
+      for _ in range(_EPISODE_LENGTH.value):
+        key, act_key = jax.random.split(key)
+        act = jit_inference_fn(state.obs, act_key)[0]
+        state = jit_step(state, act)
+        traj.append(state)
+        if bool(state.done):
+          break
+      frames = eval_env.render(traj[::render_every], height=480, width=640, scene_option=scene_option)
+      media.write_video(f"rollout{i}.mp4", frames, fps=fps)
+      print(f"Rollout video saved as 'rollout{i}.mp4'.")
 
 
 if __name__ == "__main__":
