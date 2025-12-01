@@ -144,8 +144,8 @@ def brax_ppo_config(
     rl_config.discounting = 0.99
     rl_config.learning_rate = 3e-4
     rl_config.entropy_cost = 1e-2
-    rl_config.num_envs = 8192
-    rl_config.batch_size = 256
+    rl_config.num_envs = 32768
+    rl_config.batch_size = 1024
     rl_config.network_factory = config_dict.create(
         policy_hidden_layer_sizes=(512, 256, 128),
         value_hidden_layer_sizes=(512, 256, 128),

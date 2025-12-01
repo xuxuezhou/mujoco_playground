@@ -78,7 +78,7 @@ _PLAY_ONLY = flags.DEFINE_boolean(
 )
 _USE_WANDB = flags.DEFINE_boolean(
     "use_wandb",
-    False,
+    True,
     "Use Weights & Biases for logging (ignored in play-only mode)",
 )
 _USE_TB = flags.DEFINE_boolean(

@@ -1,0 +1,26 @@
+<mujoco>
+  <default>
+    <default class="cube">
+      <geom friction="3.0 0.02 0.001" condim="4"/>
+    </default>
+  </default>
+
+  <asset>
+    <!-- Visual mesh and texture for the beachball (put files under xmls/meshes/) -->
+    <texture name="beachball_tex" type="2d" file="meshes/material_0.png"/>
+    <material name="beachball_mat" texture="beachball_tex" texrepeat="1 1" texuniform="true"/>
+    <mesh name="cube_mesh" file="meshes/beachball_single.obj" scale="0.75 0.75 0.75"/>
+  </asset>
+
+  <worldbody>
+    <body name="cube" pos="0.4 1.25 1.2" quat="1 0 0 0" childclass="cube">
+      <freejoint name="cube_freejoint"/>
+      <!-- Visual-only mesh (no collisions) -->
+      <geom type="mesh" mesh="cube_mesh" material="beachball_mat" contype="0" conaffinity="0" density="0" group="2"/>
+      <!-- Collision geom expected by code as name 'cube' -->
+      <geom name="cube" type="sphere" size="0.12" solimp="0.9 0.95 0.001" solref="0.01 1.5"
+            mass="0.0768" friction="3.0 0.02 0.001" rgba="1 0 0 1" group="3" condim="4"/>
+      <site name="cube_center" pos="0 0 0" group="4"/>
+    </body>
+  </worldbody>
+</mujoco>
